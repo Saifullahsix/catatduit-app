@@ -16,6 +16,27 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.webkit.WebViewAssetLoader
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.ContentUris
+import android.content.ContentValues
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.provider.MediaStore
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.Worker
+import androidx.work.WorkerParameters
+import java.util.Calendar
+import java.util.concurrent.TimeUnit
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -132,8 +153,109 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showBio() {
+        val prompt = BiometricPrompt(this, ContextCompat.getMainExecutor(this),
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                    web.evaluateJavascript("window.onBio&&onBio(true)", null)
+                }
+                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                    web.evaluateJavascript("window.onBio&&onBio(false)", null)
+                }
+            })
+        val info = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Buka CatatDuit")
+            .setSubtitle("Gunakan sidik jari atau wajah")
+            .setNegativeButtonText("Pakai PIN")
+            .build()
+        prompt.authenticate(info)
+    }
+
     inner class Bridge {
         @JavascriptInterface fun takePending(): String = Store.take(this@MainActivity)
         @JavascriptInterface fun debugLog(): String = Store.logText(this@MainActivity)
+
+        @JavascriptInterface fun bioAvailable(): Boolean =
+            BiometricManager.from(this@MainActivity)
+                .canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager.BIOMETRIC_SUCCESS
+
+        @JavascriptInterface fun bioAuth() { runOnUiThread { showBio() } }
+
+        @JavascriptInterface fun saveBackup(json: String): Boolean = Backup.save(this@MainActivity, json)
+
+        @JavascriptInterface fun setReminder(h: Int, m: Int, on: Boolean) {
+            if (on && Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                runOnUiThread { requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7) }
+            }
+            Reminder.set(this@MainActivity, h, m, on)
+        }
+    }
+}
+
+/** Menyimpan backup ke folder Download (Android 10 ke atas). */
+object Backup {
+    fun save(c: Context, json: String): Boolean {
+        if (Build.VERSION.SDK_INT < 29) return false
+        return try {
+            val name = "CatatDuit-backup.json"
+            val r = c.contentResolver
+            val col = MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            var uri: Uri? = null
+            r.query(col, arrayOf(MediaStore.Downloads._ID), "${MediaStore.Downloads.DISPLAY_NAME}=?", arrayOf(name), null)?.use {
+                if (it.moveToFirst()) uri = ContentUris.withAppendedId(col, it.getLong(0))
+            }
+            if (uri == null) {
+                val v = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, name)
+                    put(MediaStore.Downloads.MIME_TYPE, "application/json")
+                    put(MediaStore.Downloads.RELATIVE_PATH, "Download/")
+                }
+                uri = r.insert(col, v)
+            }
+            val u = uri ?: return false
+            r.openOutputStream(u, "wt")?.use { it.write(json.toByteArray()) }
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+}
+
+/** Pengingat harian lewat WorkManager (waktu bisa meleset beberapa menit karena hemat baterai). */
+class ReminderWorker(c: Context, p: WorkerParameters) : Worker(c, p) {
+    override fun doWork(): Result {
+        val ctx = applicationContext
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(NotificationChannel("rem", "Pengingat", NotificationManager.IMPORTANCE_DEFAULT))
+        }
+        val pi = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val n = NotificationCompat.Builder(ctx, "rem")
+            .setSmallIcon(android.R.drawable.ic_menu_edit)
+            .setContentTitle("CatatDuit")
+            .setContentText("Sudah catat transaksi hari ini?")
+            .setContentIntent(pi)
+            .setAutoCancel(true)
+            .build()
+        nm.notify(1, n)
+        return Result.success()
+    }
+}
+
+object Reminder {
+    fun set(c: Context, h: Int, m: Int, on: Boolean) {
+        val wm = WorkManager.getInstance(c)
+        if (!on) { wm.cancelUniqueWork("rem"); return }
+        val now = Calendar.getInstance()
+        val t = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, h); set(Calendar.MINUTE, m); set(Calendar.SECOND, 0)
+        }
+        if (t.before(now)) t.add(Calendar.DAY_OF_YEAR, 1)
+        val req = PeriodicWorkRequestBuilder<ReminderWorker>(1, TimeUnit.DAYS)
+            .setInitialDelay(t.timeInMillis - now.timeInMillis, TimeUnit.MILLISECONDS)
+            .build()
+        wm.enqueueUniquePeriodicWork("rem", ExistingPeriodicWorkPolicy.UPDATE, req)
     }
 }
